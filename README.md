@@ -89,3 +89,29 @@ This project combines **technical indicators, news sentiment (Claude AI), and gu
 ---
 
 ## 🗂️ Project Structure
+
+.
+├── app.py # Main Streamlit app
+├── fo_universe.py # Instruments (indices + 30 stocks, lot sizes, tickers)
+├── demo_engine.py # Simulated trading engine (yfinance + Black-Scholes)
+├── data_engine.py # Live trading engine (Kite API)
+├── signal_engine.py # Signal scoring + exit logic + summaries
+├── news_engine.py # RSS + Claude sentiment analysis
+├── state.py # Trade state + journal tracking
+├── kite_client.py # Zerodha Kite integration
+├── requirements.txt # Dependencies
+
+
+
+---
+
+## ⚙️ Installation
+
+```bash
+pip install -r requirements.txt
+```
+## ⚙️ RUN Project
+
+```bash
+streamlit run app.py
+
