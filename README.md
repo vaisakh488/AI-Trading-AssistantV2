@@ -90,7 +90,7 @@ This project combines **technical indicators, news sentiment (Claude AI), and gu
 
 ## 🗂️ Project Structure
 
-.
+
 ├── app.py # Main Streamlit app
 ├── fo_universe.py # Instruments (indices + 30 stocks, lot sizes, tickers)
 ├── demo_engine.py # Simulated trading engine (yfinance + Black-Scholes)
