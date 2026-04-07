@@ -165,11 +165,36 @@ def get_candles_with_indicators(instrument_token: int,
     df.index.name = "date"
 
     # ── Technical indicators ──────────────────────────────────────────────
-    df.ta.ema(length=9,  append=True)
-    df.ta.ema(length=21, append=True)
-    df.ta.rsi(length=14, append=True)
-    df.ta.macd(append=True)
-    df.ta.atr(length=14, append=True)
+    # ── Indicators — only append if enough rows exist ─────────────────────
+    # pandas-ta silently skips appending when len(df) < period.
+    # EMA_21 needs at least 21 rows; EMA_9 needs 9.
+    # We always compute manually so the column is guaranteed to exist.
+
+    df["EMA_9"]  = df["close"].ewm(span=9,  adjust=False).mean()
+    df["EMA_21"] = df["close"].ewm(span=21, adjust=False).mean()
+
+    # RSI (manual — avoids pandas-ta missing-column issue on short data)
+    delta = df["close"].diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    avg_g = gain.ewm(com=13, adjust=False).mean()
+    avg_l = loss.ewm(com=13, adjust=False).mean()
+    rs    = avg_g / avg_l.replace(0, np.nan)
+    df["RSI_14"] = 100 - (100 / (1 + rs))
+
+    # MACD (manual)
+    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+    df["MACD_12_26_9"]  = ema12 - ema26
+    df["MACDs_12_26_9"] = df["MACD_12_26_9"].ewm(span=9, adjust=False).mean()
+    df["MACDh_12_26_9"] = df["MACD_12_26_9"] - df["MACDs_12_26_9"]
+
+    # ATR (manual)
+    hl  = df["high"] - df["low"]
+    hpc = (df["high"] - df["close"].shift(1)).abs()
+    lpc = (df["low"]  - df["close"].shift(1)).abs()
+    tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
+    df["ATRr_14"] = tr.ewm(com=13, adjust=False).mean()
 
     # VWAP (manual — reliable across all symbols)
     df["cum_vol"]   = df["volume"].cumsum()
@@ -201,9 +226,11 @@ def get_candles_with_indicators(instrument_token: int,
     df["is_pinbar_bear"] = (df["upper_wick"] > df["body"] * 2) & (df["lower_wick"] < df["body"])
 
     df["above_vwap"]  = df["close"] > df["vwap"]
-    df["ema_bullish"] = df.get("EMA_9", df["close"]) > df.get("EMA_21", df["close"])
+    df["ema_bullish"] = df["EMA_9"] > df["EMA_21"]
 
-    return df.dropna(subset=["EMA_9", "EMA_21"])
+    # Drop only the first few rows where EMA_9 is warming up (< 9 rows of history)
+    # Never raise KeyError — columns always exist now
+    return df.iloc[9:] if len(df) > 9 else df
 
 
 # ── Option live price (Phase 2 monitoring) ────────────────────────────────

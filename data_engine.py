@@ -99,20 +99,36 @@ def get_candles_with_indicators(instrument_token: int,
     df.set_index("date", inplace=True)
     df.columns = [c.lower() for c in df.columns]
 
-    df.ta.ema(length=9,  append=True)
-    df.ta.ema(length=21, append=True)
-    df.ta.rsi(length=14, append=True)
-    df.ta.macd(append=True)
-    df.ta.atr(length=14, append=True)
+    # Manual indicators — guaranteed columns regardless of row count
+    df["EMA_9"]  = df["close"].ewm(span=9,  adjust=False).mean()
+    df["EMA_21"] = df["close"].ewm(span=21, adjust=False).mean()
+
+    delta = df["close"].diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    avg_g = gain.ewm(com=13, adjust=False).mean()
+    avg_l = loss.ewm(com=13, adjust=False).mean()
+    df["RSI_14"] = 100 - (100 / (1 + avg_g / avg_l.replace(0, np.nan)))
+
+    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+    df["MACD_12_26_9"]  = ema12 - ema26
+    df["MACDs_12_26_9"] = df["MACD_12_26_9"].ewm(span=9, adjust=False).mean()
+    df["MACDh_12_26_9"] = df["MACD_12_26_9"] - df["MACDs_12_26_9"]
+
+    hl  = df["high"] - df["low"]
+    hpc = (df["high"] - df["close"].shift(1)).abs()
+    lpc = (df["low"]  - df["close"].shift(1)).abs()
+    df["ATRr_14"] = pd.concat([hl, hpc, lpc], axis=1).max(axis=1).ewm(com=13, adjust=False).mean()
 
     df["cum_vol"]   = df["volume"].cumsum()
     df["cum_volvp"] = (df["volume"] * (df["high"] + df["low"] + df["close"]) / 3).cumsum()
     df["vwap"]      = (df["cum_volvp"] / df["cum_vol"].replace(0, np.nan)).ffill()
     df.drop(columns=["cum_vol", "cum_volvp"], inplace=True)
 
-    df["body"]       = abs(df["close"] - df["open"])
-    df["upper_wick"] = df["high"] - df[["open", "close"]].max(axis=1)
-    df["lower_wick"] = df[["open", "close"]].min(axis=1) - df["low"]
+    df["body"]         = abs(df["close"] - df["open"])
+    df["upper_wick"]   = df["high"] - df[["open", "close"]].max(axis=1)
+    df["lower_wick"]   = df[["open", "close"]].min(axis=1) - df["low"]
     df["candle_range"] = df["high"] - df["low"]
 
     df["is_bullish"] = df["close"] > df["open"]
@@ -129,9 +145,9 @@ def get_candles_with_indicators(instrument_token: int,
     df["is_pinbar_bear"] = (df["upper_wick"] > df["body"] * 2) & (df["lower_wick"] < df["body"])
 
     df["above_vwap"]  = df["close"] > df["vwap"]
-    df["ema_bullish"] = df.get("EMA_9", df["close"]) > df.get("EMA_21", df["close"])
+    df["ema_bullish"] = df["EMA_9"] > df["EMA_21"]
 
-    return df.dropna(subset=["EMA_9", "EMA_21"])
+    return df.iloc[9:] if len(df) > 9 else df
 
 
 def _days_to_expiry_str(expiry: str) -> int:

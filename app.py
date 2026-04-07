@@ -37,6 +37,7 @@ from fo_universe import (
 from signal_engine import get_trend_signal, get_exit_signal
 from state import ActiveTrade, save_trade, load_journal, get_journal_stats
 from news_engine import fetch_pulse_headlines, get_news_sentiment
+from scanner_engine import BASKETS, scan_basket, claude_pick_best
 
 load_dotenv()
 
@@ -116,6 +117,11 @@ _defaults = {
     "beginner_mode":  True,
     "wizard_step":    1,
     "last_refresh":   0.0,
+    "scanner_results": [],
+    "scanner_done":    False,
+    "scanner_basket":  "🏆 Top picks (indices)",
+    "scanner_budget":  5000,
+    "scanner_pick":    "",
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -231,9 +237,10 @@ with st.sidebar:
 # TABS
 # ══════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab_scanner, tab3 = st.tabs([
     "🔍 Phase 1 — Find Trade",
     "📡 Phase 2 — Monitor & Exit",
+    "🔭 Market Scanner",
     "📒 My Journal",
 ])
 
@@ -883,6 +890,194 @@ Rules:
         else:
             time.sleep(1)
             st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# MARKET SCANNER
+# ══════════════════════════════════════════════════════════════════════════
+
+with tab_scanner:
+    st.subheader("🔭 Market Scanner — Let Claude pick today's best trade")
+
+    if st.session_state.beginner_mode:
+        st.caption(
+            "Select a group of stocks/indices below, click Scan, and Claude will "
+            "analyse all of them and tell you which single one is best to trade today."
+        )
+    else:
+        st.caption("Multi-instrument technical + news scan. Claude ranks and picks the strongest setup.")
+
+    sc1, sc2, sc3 = st.columns([3, 2, 1])
+
+    basket_name = sc1.selectbox(
+        "Scan basket",
+        list(BASKETS.keys()),
+        index=list(BASKETS.keys()).index(st.session_state.scanner_basket)
+              if st.session_state.scanner_basket in BASKETS else 0,
+        key="basket_select",
+    )
+    st.session_state.scanner_basket = basket_name
+
+    if basket_name == "🎯 Custom":
+        basket_instruments = sc1.multiselect(
+            "Pick instruments",
+            ALL_INDICES + ALL_STOCKS_FO,
+            default=["NIFTY", "BANKNIFTY", "RELIANCE", "HDFCBANK"],
+            key="custom_basket",
+        )
+    else:
+        basket_instruments = BASKETS[basket_name]
+        sc1.caption("Scanning: " + ", ".join(basket_instruments))
+
+    scan_budget = sc2.number_input(
+        "Budget per lot (Rs)", 2000, 20000,
+        st.session_state.scanner_budget, step=500,
+        key="scanner_budget_input",
+    )
+    st.session_state.scanner_budget = scan_budget
+
+    sc3.write("")
+    sc3.write("")
+    run_scan = sc3.button("🔭 Scan all", use_container_width=True, type="primary")
+
+    if run_scan and basket_instruments:
+        sentiment = get_news_sentiment("NIFTY")
+        news_bias = sentiment.get("bias", "NEUTRAL")
+        results   = []
+        progress  = st.progress(0, text="Scanning instruments...")
+        total     = len(basket_instruments)
+
+        from scanner_engine import score_instrument
+        for i, sym in enumerate(basket_instruments):
+            progress.progress((i + 1) / total, text=f"Scanning {sym}...")
+            r = score_instrument(sym, scan_budget, news_bias)
+            if r:
+                results.append(r)
+
+        progress.empty()
+        results.sort(key=lambda x: (not x.get("affordable", False), -abs(x["score"])))
+        st.session_state.scanner_results = results
+        st.session_state.scanner_done    = True
+        st.session_state.scanner_pick    = ""
+
+    # ── Results table ──────────────────────────────────────────────────────
+    if st.session_state.scanner_done and st.session_state.scanner_results:
+        results = st.session_state.scanner_results
+
+        st.markdown("#### Scan results")
+
+        rows = []
+        for r in results:
+            signal = "🟢" if r["score"] >= 2 else ("🔴" if r["score"] <= -2 else "🟡")
+            rows.append({
+                "":           signal,
+                "Instrument": r["underlying"],
+                "Category":   r.get("category", ""),
+                "Price":      f"Rs{r['ltp']:,.2f}",
+                "Change":     f"{r['change_pct']:+.2f}%",
+                "Score":      r["score"],
+                "Direction":  r["direction"].replace("STRONG_", "S."),
+                "RSI":        r["rsi"],
+                "VWAP":       "Y" if r["above_vwap"]  else "N",
+                "EMA":        "Y" if r["ema_bullish"] else "N",
+                "Trade":      r["opt_type"],
+                "Strike":     f"{r['atm_strike']:,.0f}",
+                "Premium":    r["atm_premium"],
+                "Lot cost":   f"Rs{r['lot_cost']:,.0f}",
+                "Budget OK":  "Y" if r["affordable"] else "N",
+            })
+
+        df_scan = pd.DataFrame(rows)
+
+        # Find best affordable row index
+        best_idx = next(
+            (i for i, r in enumerate(results) if r.get("affordable")), None
+        )
+
+        def _color_scan_row(row):
+            try:
+                idx = df_scan.index[df_scan["Instrument"] == row["Instrument"]].tolist()
+                if idx and idx[0] == best_idx:
+                    return ["background-color: #0d2b0d"] * len(row)
+                score_val = next(
+                    (r["score"] for r in results if r["underlying"] == row["Instrument"]), 0
+                )
+                if score_val >= 3:
+                    return ["color: #26a69a"] * len(row)
+                if score_val <= -3:
+                    return ["color: #ef5350"] * len(row)
+            except Exception:
+                pass
+            return [""] * len(row)
+
+        st.dataframe(
+            df_scan.style.apply(_color_scan_row, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if st.session_state.beginner_mode:
+            st.caption(
+                "Highlighted row = strongest affordable signal. "
+                "Score > 0 = buy CE (market going up). Score < 0 = buy PE (going down). "
+                "Score near 0 = no clear direction, skip it."
+            )
+
+        st.divider()
+
+        affordable_count = sum(1 for r in results if r.get("affordable"))
+        st.caption(
+            f"{len(results)} instruments scanned · "
+            f"{affordable_count} within Rs{scan_budget:,} budget"
+        )
+
+        if st.button(
+            "🤖 Ask Claude: which is the single best trade right now?",
+            use_container_width=True,
+            type="primary",
+            key="claude_pick_btn",
+        ):
+            sentiment = get_news_sentiment("NIFTY")
+            with st.spinner("Claude is comparing all signals and picking the best trade..."):
+                pick = claude_pick_best(
+                    scan_results=results,
+                    budget=scan_budget,
+                    news_bias=sentiment.get("bias", "NEUTRAL"),
+                    news_themes=sentiment.get("key_themes", []),
+                    news_hint=sentiment.get("trade_hint", ""),
+                    beginner_mode=st.session_state.beginner_mode,
+                )
+            st.session_state.scanner_pick = pick
+
+        # ── Claude's answer ────────────────────────────────────────────────
+        if st.session_state.scanner_pick:
+            st.markdown("#### Claude's recommendation")
+            st.success(st.session_state.scanner_pick)
+
+            st.divider()
+
+            import re
+            match = re.search(
+                r"Best trade:\s*\*{0,2}([A-Z0-9&.\-]+)\s+(CE|PE)\*{0,2}",
+                st.session_state.scanner_pick,
+            )
+            if match:
+                sym_pick  = match.group(1).strip()
+                type_pick = match.group(2).strip()
+                if sym_pick in ALL_CONFIGS:
+                    if st.button(
+                        f"Go to Phase 1 with {sym_pick} {type_pick}",
+                        type="primary",
+                        key="load_pick_btn",
+                    ):
+                        st.session_state.underlying  = sym_pick
+                        st.session_state.scan_done   = False
+                        st.session_state.wizard_step = 1
+                        st.success(
+                            f"Switched to {sym_pick}. "
+                            "Now go to Phase 1 tab, click Scan, then fill the trade entry form."
+                        )
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # PHASE 3 — TRADE JOURNAL
