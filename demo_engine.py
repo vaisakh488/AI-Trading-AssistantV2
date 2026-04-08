@@ -4,17 +4,17 @@ demo_engine.py
 Simulates live Kite data using yfinance + Black-Scholes options pricing.
 Works for ALL instruments in fo_universe.py (indices + stocks).
 
-Data is real market data via yfinance — ~15 min delayed, not live tick.
-Used when KITE_ACCESS_TOKEN is not set.
+FIX v2:
+- get_candles_with_indicators now accepts interval param: "1m" or "5m"
+- 5m interval fetches period="5d" to get enough bars
+- All indicator columns guaranteed regardless of interval
 """
 
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
 import math
 from datetime import datetime, date, timedelta
-from functools import lru_cache
 
 from fo_universe import ALL_CONFIGS, LOT_SIZES, ATM_STEPS
 
@@ -28,7 +28,6 @@ def get_index_snapshot(underlying: str = "NIFTY") -> dict:
     ticker = yf.Ticker(sym)
     hist   = ticker.history(period="2d", interval="1m")
 
-    # Fallback ticker
     if hist.empty and "yf_fallback" in cfg:
         ticker = yf.Ticker(cfg["yf_fallback"])
         hist   = ticker.history(period="2d", interval="1m")
@@ -87,10 +86,6 @@ def _fallback_snapshot(underlying: str) -> dict:
 # ── Options chain simulation ───────────────────────────────────────────────
 
 def get_atm_options(underlying: str, budget: int = 5000) -> list[dict]:
-    """
-    Generates ATM ± 4 strikes using Black-Scholes with real historical vol.
-    Filters by budget (lot_cost <= budget * 1.3 to show slightly OTM too).
-    """
     cfg      = ALL_CONFIGS.get(underlying, ALL_CONFIGS["NIFTY"])
     snap     = get_index_snapshot(underlying)
     spot     = snap["ltp"]
@@ -144,18 +139,28 @@ def get_candles_with_indicators(instrument_token: int,
                                  underlying: str = "NIFTY",
                                  interval: str = "1m") -> pd.DataFrame:
     """
-    Fetch 1-min candles for the underlying from yfinance and compute indicators.
+    Fetch candles for the underlying from yfinance and compute indicators.
+    interval: "1m" → last 1 day of 1-min bars (for Phase 1/2 chart)
+              "5m" → last 5 days of 5-min bars (for Scanner / more history)
     instrument_token is ignored in demo mode (kept for API compatibility).
     """
     cfg = ALL_CONFIGS.get(underlying, ALL_CONFIGS["NIFTY"])
     sym = cfg["yf_symbol"]
 
+    # Map interval to appropriate yfinance period
+    if interval in ("5m", "5min"):
+        yf_interval = "5m"
+        yf_period   = "5d"
+    else:
+        yf_interval = "1m"
+        yf_period   = "1d"
+
     ticker = yf.Ticker(sym)
-    hist   = ticker.history(period="1d", interval="1m")
+    hist   = ticker.history(period=yf_period, interval=yf_interval)
 
     if hist.empty and "yf_fallback" in cfg:
         ticker = yf.Ticker(cfg["yf_fallback"])
-        hist   = ticker.history(period="1d", interval="1m")
+        hist   = ticker.history(period=yf_period, interval=yf_interval)
 
     if hist.empty:
         return pd.DataFrame()
@@ -165,15 +170,9 @@ def get_candles_with_indicators(instrument_token: int,
     df.index.name = "date"
 
     # ── Technical indicators ──────────────────────────────────────────────
-    # ── Indicators — only append if enough rows exist ─────────────────────
-    # pandas-ta silently skips appending when len(df) < period.
-    # EMA_21 needs at least 21 rows; EMA_9 needs 9.
-    # We always compute manually so the column is guaranteed to exist.
-
     df["EMA_9"]  = df["close"].ewm(span=9,  adjust=False).mean()
     df["EMA_21"] = df["close"].ewm(span=21, adjust=False).mean()
 
-    # RSI (manual — avoids pandas-ta missing-column issue on short data)
     delta = df["close"].diff()
     gain  = delta.clip(lower=0)
     loss  = (-delta).clip(lower=0)
@@ -182,25 +181,32 @@ def get_candles_with_indicators(instrument_token: int,
     rs    = avg_g / avg_l.replace(0, np.nan)
     df["RSI_14"] = 100 - (100 / (1 + rs))
 
-    # MACD (manual)
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["MACD_12_26_9"]  = ema12 - ema26
     df["MACDs_12_26_9"] = df["MACD_12_26_9"].ewm(span=9, adjust=False).mean()
     df["MACDh_12_26_9"] = df["MACD_12_26_9"] - df["MACDs_12_26_9"]
 
-    # ATR (manual)
     hl  = df["high"] - df["low"]
     hpc = (df["high"] - df["close"].shift(1)).abs()
     lpc = (df["low"]  - df["close"].shift(1)).abs()
     tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
     df["ATRr_14"] = tr.ewm(com=13, adjust=False).mean()
 
-    # VWAP (manual — reliable across all symbols)
-    df["cum_vol"]   = df["volume"].cumsum()
-    df["cum_volvp"] = (df["volume"] * (df["high"] + df["low"] + df["close"]) / 3).cumsum()
-    df["vwap"]      = (df["cum_volvp"] / df["cum_vol"].replace(0, np.nan)).ffill()
-    df.drop(columns=["cum_vol", "cum_volvp"], inplace=True)
+    # VWAP — reset daily for 1m; for 5m, compute across full window
+    if yf_interval == "1m":
+        today_mask = df.index.date == date.today()
+        df_today   = df[today_mask].copy()
+        if df_today.empty:
+            df_today = df.copy()
+        cum_vol   = df_today["volume"].cumsum()
+        cum_volvp = (df_today["volume"] * (df_today["high"] + df_today["low"] + df_today["close"]) / 3).cumsum()
+        vwap_today = (cum_volvp / cum_vol.replace(0, np.nan)).ffill()
+        df["vwap"] = vwap_today.reindex(df.index).ffill().bfill()
+    else:
+        cum_vol   = df["volume"].cumsum()
+        cum_volvp = (df["volume"] * (df["high"] + df["low"] + df["close"]) / 3).cumsum()
+        df["vwap"] = (cum_volvp / cum_vol.replace(0, np.nan)).ffill()
 
     # ── Candle patterns ───────────────────────────────────────────────────
     df["body"]         = abs(df["close"] - df["open"])
@@ -228,8 +234,6 @@ def get_candles_with_indicators(instrument_token: int,
     df["above_vwap"]  = df["close"] > df["vwap"]
     df["ema_bullish"] = df["EMA_9"] > df["EMA_21"]
 
-    # Drop only the first few rows where EMA_9 is warming up (< 9 rows of history)
-    # Never raise KeyError — columns always exist now
     return df.iloc[9:] if len(df) > 9 else df
 
 
@@ -237,10 +241,6 @@ def get_candles_with_indicators(instrument_token: int,
 
 def get_option_live_price(strike: float, opt_type: str,
                            underlying: str = "NIFTY") -> dict:
-    """
-    Approximate live option LTP using Black-Scholes from current spot.
-    Used in Phase 2 when Kite is not connected.
-    """
     cfg   = ALL_CONFIGS.get(underlying, ALL_CONFIGS["NIFTY"])
     snap  = get_index_snapshot(underlying)
     spot  = snap["ltp"]
@@ -258,7 +258,6 @@ def get_option_live_price(strike: float, opt_type: str,
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _get_iv(underlying: str, cfg: dict) -> float:
-    """Historical volatility as IV proxy. Cached implicitly via yfinance."""
     sym = cfg["yf_symbol"]
     try:
         ticker = yf.Ticker(sym)

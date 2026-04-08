@@ -1,24 +1,13 @@
 """
 app.py — NSE Options Assistant (Production)
 --------------------------------------------
-Token-efficient, beginner-friendly intraday options trading assistant.
-
-Features:
-- Phase 1: Find the best CE/PE to buy with news sentiment + technicals
-- Phase 2: Monitor live trade, auto-trail SL, plain-English exit signals
-- Phase 3: Trade journal with win-rate stats
-- Beginner mode: plain English, no jargon, step-by-step wizard
-- All 30+ F&O instruments (indices + stocks)
-- News from Zerodha Pulse with Claude sentiment (token-efficient)
-- Uses claude-haiku for quick tasks, claude-sonnet only for deep analysis
-
-Cost optimisation:
-- Haiku for news sentiment (~30 tokens in, ~50 out)
-- Sonnet only for trade recommendation chat
-- Snapshots and sentiment cached (10-15 min TTL)
-- Chat history trimmed to last 6 messages before each LLM call
+v3 fixes:
+1. Scanner: surfaces errors, fallback data shown even without candles
+2. Chart: 1m / 5m interval toggle; 5m gives better trend context
+3. Autofill: Claude's trade recommendation auto-populates entry form
 """
 
+import re
 import streamlit as st
 import anthropic
 import json
@@ -68,14 +57,13 @@ def load_skills() -> str:
 SKILLS = load_skills()
 CLAUDE = anthropic.Anthropic()
 
-# ── LLM helpers (token-efficient) ─────────────────────────────────────────
+# ── LLM helpers ───────────────────────────────────────────────────────────
 
 def ask_claude_sonnet(system: str, messages: list) -> str:
-    """Full model for detailed trade analysis. Trim history to last 6 turns."""
     trimmed = messages[-6:] if len(messages) > 6 else messages
     resp = CLAUDE.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=900,           # reduced from 1500 — enough for trade guidance
+        max_tokens=900,
         system=system,
         messages=trimmed,
     )
@@ -83,13 +71,75 @@ def ask_claude_sonnet(system: str, messages: list) -> str:
 
 
 def ask_claude_haiku(prompt: str) -> str:
-    """Cheap model for short structured tasks."""
     resp = CLAUDE.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}],
     )
     return resp.content[0].text
+
+# ── Autofill parser ────────────────────────────────────────────────────────
+
+def parse_trade_from_reply(reply: str, underlying: str) -> dict:
+    """
+    Extract trade details from Claude's text reply.
+    Returns a dict with keys: option_type, strike, entry_price, target_pct, sl_pct
+    Returns {} if nothing useful found.
+    """
+    result = {}
+
+    # Option type: CE or PE
+    m = re.search(r'\b(CE|PE)\b', reply, re.IGNORECASE)
+    if m:
+        result["option_type"] = m.group(1).upper()
+
+    # Strike price: "Strike: ₹24500" or "24500 CE" or "strike of 24500"
+    m = re.search(r'[Ss]trike[:\s₹]*([0-9,]+)', reply)
+    if not m:
+        # try "24500 CE/PE" pattern
+        m = re.search(r'([0-9]{4,6})\s*(CE|PE)', reply, re.IGNORECASE)
+    if m:
+        try:
+            result["strike"] = float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    # Entry price: "Entry range: ₹80 – ₹90" → take midpoint; or "Entry: ₹85"
+    m = re.search(r'[Ee]ntry[^₹\d]*₹\s*([0-9.]+)\s*[–\-–]\s*₹?\s*([0-9.]+)', reply)
+    if m:
+        try:
+            low  = float(m.group(1))
+            high = float(m.group(2))
+            result["entry_price"] = round((low + high) / 2, 1)
+        except ValueError:
+            pass
+    else:
+        m = re.search(r'[Ee]ntry[^₹\d]*₹\s*([0-9.]+)', reply)
+        if m:
+            try:
+                result["entry_price"] = float(m.group(1))
+            except ValueError:
+                pass
+
+    # Stop loss %: "Stop loss: ₹64 (–20%)" or "SL: 20%"
+    m = re.search(r'[Ss]top\s*[Ll]oss[^%\d]*[\-–]?\s*([0-9.]+)\s*%', reply)
+    if not m:
+        m = re.search(r'\bSL[^%\d]*[\-–]?\s*([0-9.]+)\s*%', reply)
+    if m:
+        try:
+            result["sl_pct"] = float(m.group(1))
+        except ValueError:
+            pass
+
+    # Target %: "Target: ₹104 (+30%)" or "Target: 30%"
+    m = re.search(r'[Tt]arget[^%\d]*\+?\s*([0-9.]+)\s*%', reply)
+    if m:
+        try:
+            result["target_pct"] = float(m.group(1))
+        except ValueError:
+            pass
+
+    return result
 
 # ── Page config ────────────────────────────────────────────────────────────
 
@@ -103,25 +153,29 @@ st.set_page_config(
 # ── Session state defaults ─────────────────────────────────────────────────
 
 _defaults = {
-    "phase1_msgs":    [],
-    "phase2_msgs":    [],
-    "active_trade":   ActiveTrade(),
-    "monitor_on":     False,
-    "scan_done":      False,
-    "scan_snapshot":  {},
-    "scan_options":   [],
-    "scan_trend":     {},
-    "scan_sentiment": {},
-    "underlying":     "NIFTY",
-    "budget":         5000,
-    "beginner_mode":  True,
-    "wizard_step":    1,
-    "last_refresh":   0.0,
-    "scanner_results": [],
-    "scanner_done":    False,
-    "scanner_basket":  "🏆 Top picks (indices)",
-    "scanner_budget":  5000,
-    "scanner_pick":    "",
+    "phase1_msgs":       [],
+    "phase2_msgs":       [],
+    "active_trade":      ActiveTrade(),
+    "monitor_on":        False,
+    "scan_done":         False,
+    "scan_snapshot":     {},
+    "scan_options":      [],
+    "scan_trend":        {},
+    "scan_sentiment":    {},
+    "underlying":        "NIFTY",
+    "budget":            5000,
+    "beginner_mode":     True,
+    "wizard_step":       1,
+    "last_refresh":      0.0,
+    "scanner_results":   [],
+    "scanner_done":      False,
+    "scanner_basket":    "🏆 Top picks (indices)",
+    "scanner_budget":    5000,
+    "scanner_pick":      "",
+    "scanner_errors":    [],
+    # Autofill fields from Claude recommendation
+    "autofill":          {},   # {option_type, strike, entry_price, target_pct, sl_pct}
+    "chart_interval":    "1m",
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -148,7 +202,6 @@ ACTION_LABEL = {
 }
 
 def is_market_open() -> tuple[bool, bool, bool]:
-    """Returns (is_open, is_best_window, is_exit_only)"""
     now  = datetime.now()
     h, m = now.hour, now.minute
     is_open       = (h == 9 and m >= 15) or (9 < h < 15) or (h == 15 and m == 0)
@@ -163,7 +216,6 @@ def is_market_open() -> tuple[bool, bool, bool]:
 with st.sidebar:
     st.markdown("## 📊 NSE Options Assistant")
 
-    # Mode badge
     if LIVE_MODE:
         st.success("🟢 LIVE MODE — Kite Connect")
     else:
@@ -172,7 +224,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Beginner / Expert toggle
     st.session_state.beginner_mode = st.toggle(
         "🎓 Beginner mode (plain English)",
         value=st.session_state.beginner_mode,
@@ -181,7 +232,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Market status
     is_open, best_window, exit_only = is_market_open()
     if is_open:
         if best_window:
@@ -197,7 +247,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Kite login (demo mode only)
     if not LIVE_MODE:
         with st.expander("🔑 Connect Kite for live data"):
             api_key = os.getenv("KITE_API_KEY", "")
@@ -225,12 +274,11 @@ with st.sidebar:
 
     st.divider()
 
-    # Quick lot sizes reference
     with st.expander("📋 Lot sizes reference"):
         cats = instruments_by_category()
         for cat, syms in cats.items():
             st.caption(f"**{cat}**")
-            for sym in syms[:6]:   # show first 6 per category
+            for sym in syms[:6]:
                 st.caption(f"  {sym}: {LOT_SIZES[sym]}")
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -250,7 +298,6 @@ tab1, tab2, tab_scanner, tab3 = st.tabs([
 
 with tab1:
 
-    # ── Beginner wizard header ─────────────────────────────────────────────
     if st.session_state.beginner_mode:
         st.subheader("Find your trade — 3 easy steps")
         step = st.session_state.wizard_step
@@ -268,13 +315,12 @@ with tab1:
         st.subheader("Find the right option to buy")
 
     if not LIVE_MODE:
-        st.info("📊 Demo mode — real yfinance data, ~15 min delayed. Perfect for paper trading and strategy testing.")
+        st.info("📊 Demo mode — real yfinance data, ~15 min delayed. Perfect for paper trading.")
 
     # ── Controls ───────────────────────────────────────────────────────────
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([2, 2, 2, 1])
 
-    # Instrument selector with category grouping
-    cats  = instruments_by_category()
+    cats    = instruments_by_category()
     cat_opts = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX",
                 "──── Stock F&O ────"] + ALL_STOCKS_FO
     underlying = ctrl1.selectbox(
@@ -288,22 +334,33 @@ with tab1:
         underlying = st.session_state.underlying
 
     budget   = ctrl2.number_input("Budget per lot (₹)", 2000, 20000, st.session_state.budget, step=500, key="budget_input")
-    ctrl3.write("")
-    ctrl3.write("")
-    scan_btn = ctrl3.button("🔍 Scan live data", use_container_width=True, type="primary")
+
+    # ── Chart interval selector ────────────────────────────────────────────
+    chart_interval = ctrl3.radio(
+        "Chart timeframe",
+        ["1m", "5m"],
+        index=0 if st.session_state.chart_interval == "1m" else 1,
+        horizontal=True,
+        help="1m = real-time intraday | 5m = better trend context (last 5 days)",
+        key="chart_interval_radio",
+    )
+    st.session_state.chart_interval = chart_interval
+
+    scan_btn_row = ctrl3.button("🔍 Scan live data", use_container_width=True, type="primary")
 
     ls   = LOT_SIZES.get(underlying, 75)
     step_val = ATM_STEPS.get(underlying, 50)
     ctrl4.metric("Lot size", f"{ls}")
 
-    if scan_btn:
+    if scan_btn_row:
         with st.spinner(f"Fetching {underlying} data and news..."):
             try:
                 snap      = get_index_snapshot(underlying)
                 opts      = get_atm_options(underlying, budget)
                 sentiment = get_news_sentiment(underlying)
 
-                df_c  = get_candles_with_indicators(0, underlying=underlying)
+                df_c  = get_candles_with_indicators(0, underlying=underlying,
+                                                     interval=chart_interval)
                 trend = get_trend_signal(df_c, sentiment.get("bias", "NEUTRAL")) if not df_c.empty else {}
 
                 st.session_state.scan_snapshot  = snap
@@ -325,7 +382,6 @@ with tab1:
         trend     = st.session_state.scan_trend
         sentiment = st.session_state.scan_sentiment
 
-        # ── Index metrics ──────────────────────────────────────────────────
         m1, m2, m3, m4, m5 = st.columns(5)
         chg_color = "normal" if snap.get("change_pct", 0) >= 0 else "inverse"
         m1.metric(und,          f"₹{snap.get('ltp', 0):,.2f}",   f"{snap.get('change_pct', 0)}%", delta_color=chg_color)
@@ -335,10 +391,8 @@ with tab1:
         m5.metric("Lot size",   f"{snap.get('lot_size', ls)}")
         st.caption(f"Data: {snap.get('data_source', '—')} | Strike step: ₹{snap.get('step', step_val)}")
 
-        # ── News sentiment card ────────────────────────────────────────────
         bias        = sentiment.get("bias", "NEUTRAL")
         bias_icons  = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}
-        bias_colors = {"BULLISH": "green", "BEARISH": "red", "NEUTRAL": "orange"}
         themes      = sentiment.get("key_themes", [])
         hint        = sentiment.get("trade_hint", "")
         conf        = sentiment.get("confidence", 50)
@@ -357,7 +411,6 @@ with tab1:
                 else:
                     st.caption(f"• {title}")
 
-        # ── Trend summary ──────────────────────────────────────────────────
         if trend:
             if st.session_state.beginner_mode:
                 t_label, t_color = TREND_LABEL.get(trend.get("trend", "UNKNOWN"), ("Unknown", "gray"))
@@ -375,7 +428,6 @@ with tab1:
                 tc4.metric("VWAP",        "Above" if trend.get("above_vwap") else "Below")
                 tc5.metric("News bias",   trend.get("news_bias", "NEUTRAL"))
 
-        # ── Warnings for illiquid instruments ─────────────────────────────
         if und == "FINNIFTY":
             st.warning("⚠️ FINNIFTY: yfinance data may be incomplete. If chart is empty, try NIFTY or BANKNIFTY.")
         elif und == "MIDCPNIFTY":
@@ -383,21 +435,18 @@ with tab1:
         elif und in ALL_STOCKS_FO:
             st.info(f"ℹ️ {und} ({ALL_CONFIGS[und].get('description', '')}). Stock options have wider spreads than index options.")
 
-        # ── Options chain ──────────────────────────────────────────────────
         if opts:
             st.markdown("#### Available options within budget")
             df_opts = pd.DataFrame(opts)
             display_cols = ["strike", "type", "ltp", "oi", "volume", "lot_cost", "iv_pct", "dte"]
             display_cols = [c for c in display_cols if c in df_opts.columns]
             df_display   = df_opts[display_cols].copy()
-
             col_names = {
                 "strike": "Strike", "type": "CE/PE", "ltp": "Premium ₹",
                 "oi": "Open Interest", "volume": "Volume",
                 "lot_cost": "Lot Cost ₹", "iv_pct": "IV %", "dte": "Days to Expiry",
             }
             df_display.columns = [col_names.get(c, c) for c in display_cols]
-
             atm_strike = round(snap.get("ltp", 0) / step_val) * step_val
 
             def _highlight_atm(row):
@@ -412,35 +461,36 @@ with tab1:
             )
             if st.session_state.beginner_mode:
                 st.caption(
-                    f"🟢 Highlighted row = ATM (at-the-money) strike = ₹{atm_strike:,.0f}. "
-                    "Start here — it's the most responsive option to price moves. "
+                    f"🟢 Highlighted = ATM strike ₹{atm_strike:,.0f}. "
                     "CE = buy if you expect UP move. PE = buy if you expect DOWN move."
                 )
-            else:
-                st.caption(f"Highlighted = ATM strike (₹{atm_strike:,.0f}). IV% = implied volatility. DTE = days to expiry.")
         else:
             st.warning("No options found within budget. Try increasing budget or selecting a different instrument.")
 
-        # ── Candle chart ───────────────────────────────────────────────────
-        st.markdown("#### 1-minute chart (last 60 candles)")
+        # ── Candle chart with interval toggle ─────────────────────────────
+        interval_label = "5-minute chart (last 5 days)" if chart_interval == "5m" else "1-minute chart (last 60 candles)"
+        st.markdown(f"#### {interval_label}")
         try:
-            df_c = get_candles_with_indicators(0, underlying=und)
+            df_c = get_candles_with_indicators(0, underlying=und, interval=chart_interval)
             if not df_c.empty:
-                last60 = df_c.tail(60)
+                # Show last 60 bars for 1m, last 100 for 5m
+                tail_n = 100 if chart_interval == "5m" else 60
+                last_n = df_c.tail(tail_n)
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(
-                    x=last60.index, open=last60["open"], high=last60["high"],
-                    low=last60["low"],   close=last60["close"],
-                    name="1 min", increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+                    x=last_n.index, open=last_n["open"], high=last_n["high"],
+                    low=last_n["low"],   close=last_n["close"],
+                    name=chart_interval,
+                    increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
                 ))
-                if "EMA_9"  in last60.columns:
-                    fig.add_trace(go.Scatter(x=last60.index, y=last60["EMA_9"],  name="EMA 9",  line=dict(color="orange",     width=1.5)))
-                if "EMA_21" in last60.columns:
-                    fig.add_trace(go.Scatter(x=last60.index, y=last60["EMA_21"], name="EMA 21", line=dict(color="royalblue",  width=1.5)))
-                if "vwap"   in last60.columns:
-                    fig.add_trace(go.Scatter(x=last60.index, y=last60["vwap"],   name="VWAP",   line=dict(color="magenta",    width=1.5, dash="dot")))
+                if "EMA_9"  in last_n.columns:
+                    fig.add_trace(go.Scatter(x=last_n.index, y=last_n["EMA_9"],  name="EMA 9",  line=dict(color="orange",     width=1.5)))
+                if "EMA_21" in last_n.columns:
+                    fig.add_trace(go.Scatter(x=last_n.index, y=last_n["EMA_21"], name="EMA 21", line=dict(color="royalblue",  width=1.5)))
+                if "vwap"   in last_n.columns:
+                    fig.add_trace(go.Scatter(x=last_n.index, y=last_n["vwap"],   name="VWAP",   line=dict(color="magenta",    width=1.5, dash="dot")))
                 fig.update_layout(
-                    height=300, margin=dict(l=0, r=0, t=10, b=0),
+                    height=320, margin=dict(l=0, r=0, t=10, b=0),
                     xaxis_rangeslider_visible=False,
                     legend=dict(orientation="h", y=1.02),
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
@@ -448,10 +498,10 @@ with tab1:
                 st.plotly_chart(fig, use_container_width=True)
                 if st.session_state.beginner_mode:
                     st.caption(
-                        "📘 Orange line = short-term trend (EMA 9). "
-                        "Blue line = medium-term trend (EMA 21). "
-                        "Pink dotted = average price for today (VWAP). "
-                        "Green candles = price went up. Red = price went down."
+                        "📘 Orange = short-term trend (EMA 9). Blue = medium-term trend (EMA 21). "
+                        "Pink dotted = today's average price (VWAP). "
+                        "Green candles = price up. Red = price down."
+                        + (" | 5m chart shows multi-day trend for better accuracy." if chart_interval == "5m" else "")
                     )
             else:
                 st.warning(f"No chart data for {und}. Market may be closed or yfinance data unavailable.")
@@ -466,7 +516,21 @@ with tab1:
     else:
         st.markdown("#### Ask Claude for trade analysis")
 
-    # Quick-action buttons
+    # ── Autofill notification banner ───────────────────────────────────────
+    if st.session_state.autofill:
+        af = st.session_state.autofill
+        af_parts = []
+        if "option_type" in af: af_parts.append(f"**{af['option_type']}**")
+        if "strike"      in af: af_parts.append(f"Strike ₹{af['strike']:,.0f}")
+        if "entry_price" in af: af_parts.append(f"Entry ₹{af['entry_price']}")
+        if "target_pct"  in af: af_parts.append(f"Target +{af['target_pct']}%")
+        if "sl_pct"      in af: af_parts.append(f"SL -{af['sl_pct']}%")
+        st.success(
+            "✅ **Trade details auto-filled from Claude's recommendation!** " +
+            " | ".join(af_parts) +
+            "\n\nScroll down to the entry form — fields are pre-filled. Just verify and click Start."
+        )
+
     qc1, qc2, qc3, qc4 = st.columns(4)
     und_now = st.session_state.underlying
     ls_now  = LOT_SIZES.get(und_now, 75)
@@ -501,7 +565,6 @@ with tab1:
         st.session_state.phase1_msgs.append({"role": "user", "content": msg})
         st.rerun()
 
-    # Chat history display
     for msg in st.session_state.phase1_msgs:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -510,7 +573,7 @@ with tab1:
         st.session_state.phase1_msgs.append({"role": "user", "content": prompt})
         st.rerun()
 
-    # ── Claude response ────────────────────────────────────────────────────
+    # ── Claude response + autofill extraction ─────────────────────────────
     if st.session_state.phase1_msgs and st.session_state.phase1_msgs[-1]["role"] == "user":
         with st.chat_message("assistant"):
             with st.spinner("Analysing..."):
@@ -520,7 +583,6 @@ with tab1:
                 trend_now = st.session_state.scan_trend
                 sent_now  = st.session_state.scan_sentiment
 
-                # Compact context (saves tokens vs full JSON dump)
                 ctx_lines = [
                     f"Mode: {'DEMO' if not LIVE_MODE else 'LIVE'}",
                     f"Instrument: {und_now} | Lot: {LOT_SIZES.get(und_now, 75)} | Step: ₹{ATM_STEPS.get(und_now, 50)}",
@@ -533,7 +595,6 @@ with tab1:
                     f"News hint: {sent_now.get('trade_hint', '—')}",
                     f"Time IST: {datetime.now().strftime('%H:%M')} {datetime.now().strftime('%A %d %b %Y')}",
                 ]
-                # Top 8 options (trim to save tokens)
                 if opts_now:
                     ctx_lines.append("Top options (strike|type|premium|lot_cost|iv|dte):")
                     for o in opts_now[:8]:
@@ -541,8 +602,7 @@ with tab1:
                             f"  {o['strike']}|{o['type']}|₹{o['ltp']}|₹{o['lot_cost']}|{o.get('iv_pct','—')}%|{o.get('dte','—')}d"
                         )
 
-                ctx_str = "\n".join(ctx_lines)
-
+                ctx_str  = "\n".join(ctx_lines)
                 mode_note = (
                     "User is BEGINNER — use simple language, avoid jargon, explain every term."
                     if st.session_state.beginner_mode
@@ -563,6 +623,11 @@ Rules:
 - Warn if time is outside 9:45–14:30 IST
 - For stock options: warn about liquidity, use limit orders
 - If DEMO mode: mention data is delayed but analysis method is same
+- ALWAYS include these lines so entry form can be auto-filled:
+    Strike: ₹[number]
+    Entry range: ₹[low] – ₹[high]
+    Stop loss: ₹[price] (–[X]%)
+    Target: ₹[price] (+[X]%)
 - End EVERY response with: "⚠️ Educational only — not financial advice. Always use stop loss."
 - Keep response under 350 words."""
 
@@ -572,6 +637,14 @@ Rules:
                 ])
                 st.markdown(reply)
                 st.session_state.phase1_msgs.append({"role": "assistant", "content": reply})
+
+                # ── Auto-fill extraction ───────────────────────────────────
+                # Only autofill when the reply contains a concrete recommendation
+                if any(kw in reply.upper() for kw in ["CE", "PE", "STRIKE", "ENTRY RANGE", "STOP LOSS"]):
+                    parsed = parse_trade_from_reply(reply, und_now)
+                    if parsed:
+                        st.session_state.autofill = parsed
+
                 st.rerun()
 
     # ── Trade entry form ───────────────────────────────────────────────────
@@ -581,6 +654,16 @@ Rules:
         st.caption("Once you've placed the order on Kite app, enter the details below to start Phase 2 live monitoring.")
     else:
         st.markdown("#### Confirm trade entry → Start Phase 2")
+
+    # Read autofill values
+    af = st.session_state.autofill
+    _snap_ltp   = st.session_state.scan_snapshot.get("ltp", 24500)
+    _step_v     = ATM_STEPS.get(st.session_state.underlying, 50)
+    _default_strike = float(af.get("strike", round(_snap_ltp / _step_v) * _step_v))
+    _default_entry  = float(af.get("entry_price", 80.0))
+    _default_tgt    = int(af.get("target_pct", 30))
+    _default_sl     = int(af.get("sl_pct", 20))
+    _default_otype  = af.get("option_type", "CE")
 
     with st.form("trade_entry_form", clear_on_submit=False):
         fc1, fc2, fc3 = st.columns(3)
@@ -594,26 +677,39 @@ Rules:
             und_entry = st.session_state.underlying
 
         sym      = fc1.text_input("Symbol (optional)", placeholder="NIFTY25JAN2524500CE")
-        otype    = fc2.selectbox("CE or PE?",
-                                  ["CE", "PE"],
-                                  help="CE = Call (buy when market goes UP)\nPE = Put (buy when market goes DOWN)")
+        otype    = fc2.selectbox(
+            "CE or PE?",
+            ["CE", "PE"],
+            index=0 if _default_otype == "CE" else 1,
+            help="CE = Call (buy when market goes UP)\nPE = Put (buy when market goes DOWN)",
+        )
         ls_entry = LOT_SIZES.get(und_entry, 75)
-        strike   = fc2.number_input("Strike price", value=float(round(
-                                        st.session_state.scan_snapshot.get("ltp", 24500) /
-                                        ATM_STEPS.get(und_entry, 50)) *
-                                        ATM_STEPS.get(und_entry, 50)),
-                                     step=float(ATM_STEPS.get(und_entry, 50)))
-        eprice   = fc3.number_input("Entry premium ₹ (what you paid per unit)", value=80.0, step=0.5, min_value=0.5)
+        strike   = fc2.number_input(
+            "Strike price",
+            value=_default_strike,
+            step=float(ATM_STEPS.get(und_entry, 50)),
+        )
+        eprice   = fc3.number_input(
+            "Entry premium ₹ (what you paid per unit)",
+            value=_default_entry,
+            step=0.5, min_value=0.5,
+        )
         lots     = fc3.number_input("Number of lots", value=1, min_value=1, max_value=20)
-        tgt      = fc3.number_input("Target %", value=30, min_value=5,  max_value=200,
+        tgt      = fc3.number_input("Target %", value=_default_tgt, min_value=5, max_value=200,
                                      help="Exit when profit reaches this %")
-        sl       = fc3.number_input("Stop loss %", value=20, min_value=5, max_value=80,
+        sl       = fc3.number_input("Stop loss %", value=_default_sl, min_value=5, max_value=80,
                                      help="Exit when loss reaches this %")
 
         lot_cost_display = round(eprice * ls_entry, 0)
         total_investment = round(lot_cost_display * lots, 0)
         target_price     = round(eprice * (1 + tgt / 100), 2)
         sl_price         = round(eprice * (1 - sl / 100), 2)
+
+        # Show autofill badge if active
+        if af:
+            st.info(
+                "🤖 **Auto-filled from Claude's recommendation** — review and adjust if needed before starting."
+            )
 
         st.info(
             f"**Summary:** {lots} lot(s) × ₹{eprice} × {ls_entry} units = "
@@ -641,6 +737,7 @@ Rules:
             st.session_state.monitor_on   = True
             st.session_state.phase2_msgs  = []
             st.session_state.last_refresh = time.time()
+            st.session_state.autofill     = {}   # clear after use
             st.success(f"✅ Monitoring started! Switch to Phase 2 tab →")
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -661,7 +758,6 @@ with tab2:
         f"Entered: {trade.entry_time} | Target: +{trade.target_pct}% | SL: -{trade.sl_pct}%"
     )
 
-    # ── Fetch live data ────────────────────────────────────────────────────
     df     = pd.DataFrame()
     trend  = {}
     exit_s = {}
@@ -673,7 +769,7 @@ with tab2:
         if LIVE_MODE:
             df = get_candles_with_indicators(trade.instrument_token)
         else:
-            df = get_candles_with_indicators(0, underlying=trade.underlying)
+            df = get_candles_with_indicators(0, underlying=trade.underlying, interval="1m")
             if not df.empty:
                 idx_chg = (df.iloc[-1]["close"] - df.iloc[0]["close"]) / df.iloc[0]["close"]
                 mult    = 5 if trade.option_type == "CE" else -5
@@ -690,7 +786,6 @@ with tab2:
     except Exception as e:
         st.warning(f"Data error: {e}")
 
-    # ── Live P&L metrics ───────────────────────────────────────────────────
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Entry",      f"₹{trade.entry_price}")
     m2.metric("Current",    f"₹{ltp}",    f"{pnl:+.1f}%", delta_color="normal")
@@ -700,10 +795,8 @@ with tab2:
     m6.metric("Trend",      trend.get("trend", "—") if not st.session_state.beginner_mode
               else TREND_LABEL.get(trend.get("trend", "UNKNOWN"), ("—", "gray"))[0])
 
-    # ── Exit signal banner ─────────────────────────────────────────────────
     action   = exit_s.get("action", "HOLD")
     a_label, a_style = ACTION_LABEL.get(action, ("🟢 HOLD", "success"))
-
     display_text = (
         f"{a_label} — {exit_s.get('plain', exit_s.get('reason', ''))}"
         if st.session_state.beginner_mode
@@ -717,7 +810,6 @@ with tab2:
     else:
         st.success(display_text)
 
-    # ── Chart ──────────────────────────────────────────────────────────────
     if not df.empty:
         last45 = df.tail(45)
         fig2   = go.Figure()
@@ -736,7 +828,6 @@ with tab2:
                 fig2.add_trace(go.Scatter(x=last45.index, y=last45[col], name=name,
                                           line=dict(color=color, width=1.5, dash=dash)))
 
-        # Entry / target / SL lines
         fig2.add_hline(y=trade.entry_price,
                        line_dash="dash", line_color="yellow",
                        annotation_text=f"Entry ₹{trade.entry_price}")
@@ -755,7 +846,6 @@ with tab2:
         )
         st.plotly_chart(fig2, use_container_width=True)
 
-        # Last 5 candles table
         pattern_cols = [c for c in [
             "open", "high", "low", "close",
             "is_bullish", "is_doji", "is_engulfing_bull", "is_engulfing_bear",
@@ -776,7 +866,6 @@ with tab2:
 
     st.divider()
 
-    # ── Phase 2 Chat ───────────────────────────────────────────────────────
     st.markdown("#### Ask Claude for exit guidance")
 
     qa1, qa2, qa3, qa4 = st.columns(4)
@@ -819,7 +908,6 @@ with tab2:
     if st.session_state.phase2_msgs and st.session_state.phase2_msgs[-1]["role"] == "user":
         with st.chat_message("assistant"):
             with st.spinner("Analysing trade..."):
-
                 last5_dict = {}
                 if not df.empty and pattern_cols:
                     last5_dict = df.tail(5)[pattern_cols].to_dict()
@@ -835,8 +923,7 @@ with tab2:
                     f"Exit signal: {exit_s.get('action', 'HOLD')} — {exit_s.get('reason', '—')}",
                     f"News bias at entry: {trade.news_bias}",
                 ]
-                ctx2_str = "\n".join(ctx2_lines)
-
+                ctx2_str  = "\n".join(ctx2_lines)
                 mode_note2 = (
                     "User is BEGINNER — plain English only, no jargon."
                     if st.session_state.beginner_mode
@@ -867,7 +954,6 @@ Rules:
 
     st.divider()
 
-    # ── Close trade / auto-refresh ─────────────────────────────────────────
     col_close, col_status = st.columns([1, 3])
 
     if col_close.button("✅ Close & save trade", type="primary", use_container_width=True):
@@ -878,10 +964,9 @@ Rules:
         st.success("Trade saved to journal! View it in the 📒 My Journal tab.")
         st.rerun()
 
-    # Non-blocking auto-refresh every 60 seconds
     if st.session_state.monitor_on:
-        now_ts  = time.time()
-        elapsed = int(now_ts - st.session_state.get("last_refresh", now_ts))
+        now_ts    = time.time()
+        elapsed   = int(now_ts - st.session_state.get("last_refresh", now_ts))
         remaining = max(60 - elapsed, 0)
         col_status.caption(f"🔄 Auto-refresh in {remaining}s  |  Last updated: {datetime.now().strftime('%H:%M:%S')}")
         if elapsed >= 60:
@@ -901,8 +986,8 @@ with tab_scanner:
 
     if st.session_state.beginner_mode:
         st.caption(
-            "Select a group of stocks/indices below, click Scan, and Claude will "
-            "analyse all of them and tell you which single one is best to trade today."
+            "Select a group below, click Scan, and Claude will analyse all of them "
+            "and tell you which single one is best to trade today."
         )
     else:
         st.caption("Multi-instrument technical + news scan. Claude ranks and picks the strongest setup.")
@@ -944,21 +1029,44 @@ with tab_scanner:
         sentiment = get_news_sentiment("NIFTY")
         news_bias = sentiment.get("bias", "NEUTRAL")
         results   = []
+        errors    = []
         progress  = st.progress(0, text="Scanning instruments...")
         total     = len(basket_instruments)
 
         from scanner_engine import score_instrument
         for i, sym in enumerate(basket_instruments):
             progress.progress((i + 1) / total, text=f"Scanning {sym}...")
-            r = score_instrument(sym, scan_budget, news_bias)
-            if r:
-                results.append(r)
+            try:
+                r = score_instrument(sym, scan_budget, news_bias)
+                if r:
+                    results.append(r)
+                else:
+                    errors.append(f"{sym}: no data returned")
+            except Exception as e:
+                errors.append(f"{sym}: {e}")
 
         progress.empty()
-        results.sort(key=lambda x: (not x.get("affordable", False), -abs(x["score"])))
-        st.session_state.scanner_results = results
-        st.session_state.scanner_done    = True
-        st.session_state.scanner_pick    = ""
+
+        if not results:
+            st.error(
+                "⚠️ Scanner returned no results. This usually means yfinance timed out or "
+                "the market is closed. Try again in a minute, or check your internet connection."
+            )
+            if errors:
+                with st.expander("🐛 Debug: per-instrument errors"):
+                    for err in errors:
+                        st.caption(err)
+        else:
+            results.sort(key=lambda x: (not x.get("affordable", False), -abs(x["score"])))
+            st.session_state.scanner_results = results
+            st.session_state.scanner_errors  = errors
+            st.session_state.scanner_done    = True
+            st.session_state.scanner_pick    = ""
+
+            if errors:
+                with st.expander(f"⚠️ {len(errors)} instrument(s) had issues (click to see)"):
+                    for err in errors:
+                        st.caption(err)
 
     # ── Results table ──────────────────────────────────────────────────────
     if st.session_state.scanner_done and st.session_state.scanner_results:
@@ -973,7 +1081,7 @@ with tab_scanner:
                 "":           signal,
                 "Instrument": r["underlying"],
                 "Category":   r.get("category", ""),
-                "Price":      f"Rs{r['ltp']:,.2f}",
+                "Price":      f"₹{r['ltp']:,.2f}",
                 "Change":     f"{r['change_pct']:+.2f}%",
                 "Score":      r["score"],
                 "Direction":  r["direction"].replace("STRONG_", "S."),
@@ -983,13 +1091,12 @@ with tab_scanner:
                 "Trade":      r["opt_type"],
                 "Strike":     f"{r['atm_strike']:,.0f}",
                 "Premium":    r["atm_premium"],
-                "Lot cost":   f"Rs{r['lot_cost']:,.0f}",
-                "Budget OK":  "Y" if r["affordable"] else "N",
+                "Lot cost":   f"₹{r['lot_cost']:,.0f}",
+                "Budget OK":  "✅" if r["affordable"] else "❌",
             })
 
         df_scan = pd.DataFrame(rows)
 
-        # Find best affordable row index
         best_idx = next(
             (i for i, r in enumerate(results) if r.get("affordable")), None
         )
@@ -1028,7 +1135,7 @@ with tab_scanner:
         affordable_count = sum(1 for r in results if r.get("affordable"))
         st.caption(
             f"{len(results)} instruments scanned · "
-            f"{affordable_count} within Rs{scan_budget:,} budget"
+            f"{affordable_count} within ₹{scan_budget:,} budget"
         )
 
         if st.button(
@@ -1049,14 +1156,11 @@ with tab_scanner:
                 )
             st.session_state.scanner_pick = pick
 
-        # ── Claude's answer ────────────────────────────────────────────────
         if st.session_state.scanner_pick:
             st.markdown("#### Claude's recommendation")
             st.success(st.session_state.scanner_pick)
-
             st.divider()
 
-            import re
             match = re.search(
                 r"Best trade:\s*\*{0,2}([A-Z0-9&.\-]+)\s+(CE|PE)\*{0,2}",
                 st.session_state.scanner_pick,
@@ -1065,8 +1169,10 @@ with tab_scanner:
                 sym_pick  = match.group(1).strip()
                 type_pick = match.group(2).strip()
                 if sym_pick in ALL_CONFIGS:
-                    if st.button(
-                        f"Go to Phase 1 with {sym_pick} {type_pick}",
+                    col_go, col_autofill = st.columns(2)
+
+                    if col_go.button(
+                        f"Go to Phase 1 with {sym_pick}",
                         type="primary",
                         key="load_pick_btn",
                     ):
@@ -1078,6 +1184,30 @@ with tab_scanner:
                             "Now go to Phase 1 tab, click Scan, then fill the trade entry form."
                         )
 
+                    if col_autofill.button(
+                        f"⚡ Auto-fill entry form with this trade",
+                        type="secondary",
+                        key="scanner_autofill_btn",
+                    ):
+                        # Parse scanner recommendation into autofill
+                        parsed = parse_trade_from_reply(st.session_state.scanner_pick, sym_pick)
+                        parsed["option_type"] = type_pick
+                        # Find the result for this symbol to get strike/premium
+                        match_r = next((r for r in results if r["underlying"] == sym_pick), None)
+                        if match_r:
+                            if "strike" not in parsed:
+                                parsed["strike"] = match_r["atm_strike"]
+                            if "entry_price" not in parsed:
+                                parsed["entry_price"] = match_r["atm_premium"]
+                        st.session_state.underlying  = sym_pick
+                        st.session_state.autofill    = parsed
+                        st.session_state.scan_done   = False
+                        st.session_state.wizard_step = 1
+                        st.success(
+                            f"✅ Entry form pre-filled with {sym_pick} {type_pick}! "
+                            "Switch to Phase 1 tab → scan → then start monitoring."
+                        )
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # PHASE 3 — TRADE JOURNAL
@@ -1086,13 +1216,12 @@ with tab_scanner:
 with tab3:
     st.subheader("📒 My Trade Journal")
 
-    stats = get_journal_stats()
+    stats   = get_journal_stats()
     journal = load_journal()
 
     if stats["total"] == 0:
         st.info("No trades recorded yet. Complete a trade in Phase 2 and click 'Close & save trade'.")
     else:
-        # Summary stats
         sc1, sc2, sc3, sc4, sc5 = st.columns(5)
         sc1.metric("Total trades",  stats["total"])
         sc2.metric("Win rate",      f"{stats['win_rate']}%",
@@ -1103,20 +1232,18 @@ with tab3:
         sc5.metric("Avg loss",      f"₹{stats['avg_loss']:,.0f}")
 
         if st.session_state.beginner_mode and stats["total"] >= 3:
-            # Plain-English summary from journal
-            win_rate = stats["win_rate"]
+            win_rate  = stats["win_rate"]
             total_pnl = stats["total_pnl"]
             if win_rate >= 60 and total_pnl > 0:
-                st.success(f"✅ Great performance! You're winning {win_rate}% of trades and up ₹{total_pnl:,.0f} overall.")
+                st.success(f"✅ Great performance! Winning {win_rate}% of trades, up ₹{total_pnl:,.0f} overall.")
             elif win_rate >= 40:
                 st.info(f"📊 Decent performance. Win rate {win_rate}%. Keep using stop losses consistently.")
             else:
-                st.warning(f"⚠️ Win rate is {win_rate}% — below 50%. Review your entry timing and stick to the 9:45–11:30 AM window.")
+                st.warning(f"⚠️ Win rate {win_rate}% — below 50%. Review entry timing and stick to 9:45–11:30 AM.")
 
         st.divider()
 
-        # Journal table
-        df_j = pd.DataFrame(journal[::-1])   # newest first
+        df_j = pd.DataFrame(journal[::-1])
         if not df_j.empty:
             display_j = df_j[[c for c in [
                 "date", "time_entry", "time_exit", "underlying", "type",
@@ -1146,7 +1273,6 @@ with tab3:
                 hide_index=True,
             )
 
-        # Export button
         if st.button("⬇️ Download journal as CSV"):
             csv = pd.DataFrame(journal).to_csv(index=False)
             st.download_button(

@@ -4,12 +4,13 @@ scanner_engine.py
 Scans a basket of instruments, scores each one on technicals + news,
 and returns a ranked list ready for Claude to pick the best trade.
 
-Design goals:
-- Fast: fetches snapshots only (no full candle load per instrument)
-- Token-efficient: builds a compact table for Claude, not full JSON
+FIX v2:
+- score_instrument now prints errors instead of silently swallowing them
+- Added is_live_mode check so live data_engine is used when Kite is connected
 - Graceful: skips any instrument that fails to fetch, never crashes
 """
 
+import os
 import time
 import anthropic
 import json
@@ -36,21 +37,32 @@ BASKETS = {
 
 def score_instrument(underlying: str, budget: int, news_bias: str = "NEUTRAL") -> dict:
     """
-    Fetch snapshot + 1-min candles for one instrument and return a score dict.
+    Fetch snapshot + candles for one instrument and return a score dict.
     Returns None on any fetch error so the scanner can skip it gracefully.
     """
     try:
-        # Import here so scanner_engine works in both demo and live mode
-        try:
+        # Use live or demo engine depending on Kite token
+        live = len(os.getenv("KITE_ACCESS_TOKEN", "").strip()) > 10
+        if live:
+            try:
+                from data_engine import get_index_snapshot, get_candles_with_indicators
+            except Exception as e:
+                print(f"[scanner] Live import failed ({e}), falling back to demo")
+                from demo_engine import get_index_snapshot, get_candles_with_indicators
+        else:
             from demo_engine import get_index_snapshot, get_candles_with_indicators
-        except Exception:
-            return None
 
         snap = get_index_snapshot(underlying)
         if not snap or snap.get("ltp", 0) == 0:
+            print(f"[scanner] {underlying}: empty snapshot")
             return None
 
-        df = get_candles_with_indicators(0, underlying=underlying)
+        # Use 5-min candles for scanner (more reliable signal)
+        try:
+            df = get_candles_with_indicators(0, underlying=underlying, interval="5m")
+        except TypeError:
+            # Older signature without interval param
+            df = get_candles_with_indicators(0, underlying=underlying)
 
         cfg      = ALL_CONFIGS.get(underlying, {})
         lot_size = cfg.get("lot_size", 75)
@@ -75,20 +87,15 @@ def score_instrument(underlying: str, budget: int, news_bias: str = "NEUTRAL") -
             macd_sig    = float(last.get("MACDs_12_26_9", 0))
             chg_pct     = snap.get("change_pct", 0)
 
-            # Score signals
             score += 2  if bull_c >= 4 else (1 if bull_c == 3 else 0)
             score -= 2  if bear_c >= 4 else (1 if bear_c == 3 else 0)
             score += 1  if above_vwap  else -1
             score += 1  if ema_bullish else -1
             score += 1  if rsi > 55    else (-1 if rsi < 45 else 0)
             score += 1  if macd > macd_sig else -1
-            if rsi > 72: score -= 1  # overbought
-            if rsi < 30: score += 1  # oversold bounce potential
-
-            # News bias
+            if rsi > 72: score -= 1
+            if rsi < 30: score += 1
             score += {"BULLISH": 1, "BEARISH": -1, "NEUTRAL": 0}.get(news_bias, 0)
-
-            # Momentum: strong move today
             if abs(chg_pct) > 1.0:
                 score += 1 if chg_pct > 0 else -1
 
@@ -100,15 +107,8 @@ def score_instrument(underlying: str, budget: int, news_bias: str = "NEUTRAL") -
                 "SIDEWAYS"
             )
 
-            # Suggested option type
-            if score >= 2:
-                opt_type = "CE"
-            elif score <= -2:
-                opt_type = "PE"
-            else:
-                opt_type = "—"
+            opt_type = "CE" if score >= 2 else ("PE" if score <= -2 else "—")
 
-            # ATM premium estimate (rough Black-Scholes)
             atm_premium = _estimate_atm_premium(spot, step, df, cfg)
             lot_cost     = round(atm_premium * lot_size, 0)
             affordable   = lot_cost <= budget
@@ -128,14 +128,25 @@ def score_instrument(underlying: str, budget: int, news_bias: str = "NEUTRAL") -
                 "affordable":   affordable,
             }
         else:
+            # Fallback when candle data not available — use price direction only
             direction = "BULLISH" if snap.get("direction") == "BULLISH" else "BEARISH"
             opt_type  = "CE" if direction == "BULLISH" else "PE"
+            score     = 1 if direction == "BULLISH" else -1
+            chg_pct   = snap.get("change_pct", 0)
+            if abs(chg_pct) > 1.0:
+                score += 1 if chg_pct > 0 else -1
+
+            atm_premium = round(spot * 0.003, 1)
+            lot_cost    = round(atm_premium * lot_size, 0)
+            affordable  = lot_cost <= budget
+
+            print(f"[scanner] {underlying}: no candle data, using price direction fallback")
             details = {
                 "rsi": 50, "above_vwap": False, "ema_bullish": False,
                 "bull_candles": 0, "bear_candles": 0, "macd_bull": False,
                 "direction": direction, "opt_type": opt_type,
-                "atm_strike": atm, "atm_premium": 0,
-                "lot_cost": 0, "affordable": False,
+                "atm_strike": atm, "atm_premium": atm_premium,
+                "lot_cost": lot_cost, "affordable": affordable,
             }
 
         return {
@@ -151,6 +162,8 @@ def score_instrument(underlying: str, budget: int, news_bias: str = "NEUTRAL") -
         }
 
     except Exception as e:
+        print(f"[scanner] {underlying}: exception — {e}")
+        import traceback; traceback.print_exc()
         return None
 
 
@@ -170,7 +183,6 @@ def scan_basket(instruments: list[str], budget: int,
             if r:
                 results.append(r)
 
-    # Sort: affordable first, then by |score| desc
     results.sort(key=lambda x: (not x.get("affordable", False), -abs(x["score"])))
     return results
 
@@ -185,19 +197,12 @@ def claude_pick_best(
     news_hint: str,
     beginner_mode: bool = True,
 ) -> str:
-    """
-    Send the compact scan table to Claude (Sonnet) and get a single best
-    trade recommendation with entry/SL/target.
-
-    Token-efficient: sends a CSV-like table, not full JSON.
-    """
     if not scan_results:
         return "No scan results available. Please scan again."
 
-    # Build a compact table — much cheaper than JSON
     header = "sym|score|dir|rsi|vwap|ema|chg%|opt|atm_strike|premium|lot_cost|affordable"
     rows   = []
-    for r in scan_results[:12]:    # max 12 rows to Claude
+    for r in scan_results[:12]:
         rows.append(
             f"{r['underlying']}|{r['score']}|{r['direction']}|{r['rsi']}|"
             f"{'Y' if r['above_vwap'] else 'N'}|{'Y' if r['ema_bullish'] else 'N'}|"
@@ -249,20 +254,16 @@ Why NOT the others:
     return resp.content[0].text
 
 
-# ── Helper: quick ATM premium estimate ────────────────────────────────────
-
-def _estimate_atm_premium(spot: float, step: float,
-                           df, cfg: dict) -> float:
-    """Rough ATM CE premium estimate using historical vol and BS."""
+def _estimate_atm_premium(spot: float, step: float, df, cfg: dict) -> float:
     try:
         import math
         from scipy.stats import norm
 
-        # Get IV from recent candle returns
         if df is not None and len(df) >= 10:
             ret = df["close"].pct_change().dropna()
-            iv  = float(ret.std() * math.sqrt(252 * 375))  # annualised from 1-min
-            iv  = max(min(iv, 1.5), 0.05)                  # clamp 5%–150%
+            # annualise from 5-min bars = 252 trading days * 75 bars/day
+            iv  = float(ret.std() * math.sqrt(252 * 75))
+            iv  = max(min(iv, 1.5), 0.05)
         else:
             iv = 0.15
 
@@ -281,4 +282,4 @@ def _estimate_atm_premium(spot: float, step: float,
         premium = spot * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
         return max(round(premium, 1), 1.0)
     except Exception:
-        return round(spot * 0.003, 1)   # fallback: 0.3% of spot
+        return round(spot * 0.003, 1)
