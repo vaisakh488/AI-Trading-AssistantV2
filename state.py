@@ -15,19 +15,19 @@ JOURNAL_FILE = "trade_journal.json"
 
 @dataclass
 class ActiveTrade:
-    symbol:           str   = ""
-    instrument_token: int   = 0
-    underlying:       str   = "NIFTY"
-    option_type:      str   = ""      # CE or PE
+    symbol:           str = ""
+    instrument_token: int = 0
+    underlying:       str = "NIFTY"
+    option_type:      str = ""      # CE or PE
     strike:           float = 0.0
     entry_price:      float = 0.0
-    lot_size:         int   = 75
-    lots:             int   = 1
-    entry_time:       str   = ""
+    lot_size:         int = 75
+    lots:             int = 1
+    entry_time:       str = ""
     target_pct:       float = 30.0
     sl_pct:           float = 20.0
-    is_active:        bool  = False
-    news_bias:        str   = "NEUTRAL"   # from news_engine at entry time
+    is_active:        bool = False
+    news_bias:        str = "NEUTRAL"   # from news_engine at entry time
 
 
 # ── Trade Journal ─────────────────────────────────────────────────────────
@@ -79,16 +79,16 @@ def get_journal_stats() -> dict:
             "avg_win": 0.0, "avg_loss": 0.0,
             "best_trade": 0.0, "worst_trade": 0.0,
         }
-    wins   = [t for t in journal if t["result"] == "WIN"]
+    wins = [t for t in journal if t["result"] == "WIN"]
     losses = [t for t in journal if t["result"] == "LOSS"]
-    pnls   = [t["pnl_rs"] for t in journal]
+    pnls = [t["pnl_rs"] for t in journal]
     return {
         "total":       len(journal),
         "wins":        len(wins),
         "losses":      len(losses),
         "win_rate":    round(len(wins) / len(journal) * 100, 1),
         "total_pnl":   round(sum(pnls), 2),
-        "avg_win":     round(sum(t["pnl_rs"] for t in wins)   / max(len(wins),   1), 2),
+        "avg_win":     round(sum(t["pnl_rs"] for t in wins) / max(len(wins),   1), 2),
         "avg_loss":    round(sum(t["pnl_rs"] for t in losses) / max(len(losses), 1), 2),
         "best_trade":  round(max(pnls), 2) if pnls else 0.0,
         "worst_trade": round(min(pnls), 2) if pnls else 0.0,

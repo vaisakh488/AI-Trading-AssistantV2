@@ -28,39 +28,41 @@ def get_trend_signal(df: pd.DataFrame, news_bias: str = "NEUTRAL") -> dict:
             "plain_summary": "Not enough data yet",
         }
 
-    last  = df.iloc[-1]
+    last = df.iloc[-1]
     prev5 = df.iloc[-5:]
 
     bullish_candles = int(prev5["is_bullish"].sum())
     bearish_candles = int(prev5["is_bearish"].sum())
-    above_vwap      = bool(last.get("above_vwap",  False))
-    ema_bullish     = bool(last.get("ema_bullish",  False))
-    rsi             = float(last.get("RSI_14",       50))
-    macd            = float(last.get("MACD_12_26_9",  0))
-    macd_signal     = float(last.get("MACDs_12_26_9", 0))
+    above_vwap = bool(last.get("above_vwap",  False))
+    ema_bullish = bool(last.get("ema_bullish",  False))
+    rsi = float(last.get("RSI_14",       50))
+    macd = float(last.get("MACD_12_26_9",  0))
+    macd_signal = float(last.get("MACDs_12_26_9", 0))
 
     # ── Score each signal (max technical ±8, news ±1) ─────────────────────
     score = 0
-    score += 2  if bullish_candles >= 4 else (1  if bullish_candles == 3 else 0)
-    score -= 2  if bearish_candles >= 4 else (1  if bearish_candles == 3 else 0)
-    score += 1  if above_vwap  else -1
-    score += 1  if ema_bullish else -1
-    score += 1  if rsi > 55    else (-1 if rsi < 45 else 0)
-    score += 1  if macd > macd_signal else -1
+    score += 2 if bullish_candles >= 4 else (1 if bullish_candles == 3 else 0)
+    score -= 2 if bearish_candles >= 4 else (1 if bearish_candles == 3 else 0)
+    score += 1 if above_vwap else -1
+    score += 1 if ema_bullish else -1
+    score += 1 if rsi > 55 else (-1 if rsi < 45 else 0)
+    score += 1 if macd > macd_signal else -1
 
     # Bonus: RSI extremes
-    if rsi > 70: score -= 1   # overbought — fade CE entries
-    if rsi < 30: score += 1   # oversold  — fade PE entries
+    if rsi > 70:
+        score -= 1   # overbought — fade CE entries
+    if rsi < 30:
+        score += 1   # oversold  — fade PE entries
 
     # News bias (small weight — don't override technicals)
     news_score = {"BULLISH": 1, "BEARISH": -1, "NEUTRAL": 0}.get(news_bias, 0)
     score += news_score
 
     trend = (
-        "STRONG_BULL" if score >= 5  else
-        "BULL"        if score >= 2  else
+        "STRONG_BULL" if score >= 5 else
+        "BULL" if score >= 2 else
         "STRONG_BEAR" if score <= -5 else
-        "BEAR"        if score <= -2 else
+        "BEAR" if score <= -2 else
         "SIDEWAYS"
     )
 
@@ -137,8 +139,8 @@ def get_exit_signal(df: pd.DataFrame, entry_price: float,
         }
 
     last = df.iloc[-1]
-    ltp  = float(last["close"])
-    pnl  = round((ltp - entry_price) / entry_price * 100, 2)
+    ltp = float(last["close"])
+    pnl = round((ltp - entry_price) / entry_price * 100, 2)
 
     # ── Hard rules (highest priority) ─────────────────────────────────────
 
@@ -153,8 +155,8 @@ def get_exit_signal(df: pd.DataFrame, entry_price: float,
                      f"You've made your {target_pct}% target! Take the profit now.")
 
     # ── Time-based exit ────────────────────────────────────────────────────
-    now   = datetime.now()
-    h, m  = now.hour, now.minute
+    now = datetime.now()
+    h, m = now.hour, now.minute
     if h == 15 and m >= 0:
         return _exit("EXIT_TIME", f"3:00 PM — mandatory exit. P&L: {pnl:.1f}%",
                      ltp, pnl, "HIGH",

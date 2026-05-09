@@ -35,6 +35,7 @@ BASKETS = {
 
 # ── Per-instrument scoring ─────────────────────────────────────────────────
 
+
 def score_instrument(underlying: str, budget: int, news_bias: str = "NEUTRAL") -> dict:
     """
     Fetch snapshot + candles for one instrument and return a score dict.
@@ -64,54 +65,56 @@ def score_instrument(underlying: str, budget: int, news_bias: str = "NEUTRAL") -
             # Older signature without interval param
             df = get_candles_with_indicators(0, underlying=underlying)
 
-        cfg      = ALL_CONFIGS.get(underlying, {})
+        cfg = ALL_CONFIGS.get(underlying, {})
         lot_size = cfg.get("lot_size", 75)
-        step     = cfg.get("step", 50)
-        spot     = snap["ltp"]
-        atm      = round(spot / step) * step
+        step = cfg.get("step", 50)
+        spot = snap["ltp"]
+        atm = round(spot / step) * step
 
         # ── Technical score ────────────────────────────────────────────────
         score = 0
         details = {}
 
         if df is not None and not df.empty and len(df) >= 5:
-            last  = df.iloc[-1]
+            last = df.iloc[-1]
             prev5 = df.iloc[-5:]
 
             bull_c = int(prev5["is_bullish"].sum())
             bear_c = int(prev5["is_bearish"].sum())
-            rsi    = float(last.get("RSI_14", 50))
-            above_vwap  = bool(last.get("above_vwap",  False))
+            rsi = float(last.get("RSI_14", 50))
+            above_vwap = bool(last.get("above_vwap",  False))
             ema_bullish = bool(last.get("ema_bullish",  False))
-            macd        = float(last.get("MACD_12_26_9",  0))
-            macd_sig    = float(last.get("MACDs_12_26_9", 0))
-            chg_pct     = snap.get("change_pct", 0)
+            macd = float(last.get("MACD_12_26_9",  0))
+            macd_sig = float(last.get("MACDs_12_26_9", 0))
+            chg_pct = snap.get("change_pct", 0)
 
-            score += 2  if bull_c >= 4 else (1 if bull_c == 3 else 0)
-            score -= 2  if bear_c >= 4 else (1 if bear_c == 3 else 0)
-            score += 1  if above_vwap  else -1
-            score += 1  if ema_bullish else -1
-            score += 1  if rsi > 55    else (-1 if rsi < 45 else 0)
-            score += 1  if macd > macd_sig else -1
-            if rsi > 72: score -= 1
-            if rsi < 30: score += 1
+            score += 2 if bull_c >= 4 else (1 if bull_c == 3 else 0)
+            score -= 2 if bear_c >= 4 else (1 if bear_c == 3 else 0)
+            score += 1 if above_vwap else -1
+            score += 1 if ema_bullish else -1
+            score += 1 if rsi > 55 else (-1 if rsi < 45 else 0)
+            score += 1 if macd > macd_sig else -1
+            if rsi > 72:
+                score -= 1
+            if rsi < 30:
+                score += 1
             score += {"BULLISH": 1, "BEARISH": -1, "NEUTRAL": 0}.get(news_bias, 0)
             if abs(chg_pct) > 1.0:
                 score += 1 if chg_pct > 0 else -1
 
             direction = (
-                "STRONG_BULL" if score >= 5  else
-                "BULL"        if score >= 2  else
+                "STRONG_BULL" if score >= 5 else
+                "BULL" if score >= 2 else
                 "STRONG_BEAR" if score <= -5 else
-                "BEAR"        if score <= -2 else
+                "BEAR" if score <= -2 else
                 "SIDEWAYS"
             )
 
             opt_type = "CE" if score >= 2 else ("PE" if score <= -2 else "—")
 
             atm_premium = _estimate_atm_premium(spot, step, df, cfg)
-            lot_cost     = round(atm_premium * lot_size, 0)
-            affordable   = lot_cost <= budget
+            lot_cost = round(atm_premium * lot_size, 0)
+            affordable = lot_cost <= budget
 
             details = {
                 "rsi":          round(rsi, 1),
@@ -130,15 +133,15 @@ def score_instrument(underlying: str, budget: int, news_bias: str = "NEUTRAL") -
         else:
             # Fallback when candle data not available — use price direction only
             direction = "BULLISH" if snap.get("direction") == "BULLISH" else "BEARISH"
-            opt_type  = "CE" if direction == "BULLISH" else "PE"
-            score     = 1 if direction == "BULLISH" else -1
-            chg_pct   = snap.get("change_pct", 0)
+            opt_type = "CE" if direction == "BULLISH" else "PE"
+            score = 1 if direction == "BULLISH" else -1
+            chg_pct = snap.get("change_pct", 0)
             if abs(chg_pct) > 1.0:
                 score += 1 if chg_pct > 0 else -1
 
             atm_premium = round(spot * 0.003, 1)
-            lot_cost    = round(atm_premium * lot_size, 0)
-            affordable  = lot_cost <= budget
+            lot_cost = round(atm_premium * lot_size, 0)
+            affordable = lot_cost <= budget
 
             print(f"[scanner] {underlying}: no candle data, using price direction fallback")
             details = {
@@ -163,7 +166,8 @@ def score_instrument(underlying: str, budget: int, news_bias: str = "NEUTRAL") -
 
     except Exception as e:
         print(f"[scanner] {underlying}: exception — {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -201,7 +205,7 @@ def claude_pick_best(
         return "No scan results available. Please scan again."
 
     header = "sym|score|dir|rsi|vwap|ema|chg%|opt|atm_strike|premium|lot_cost|affordable"
-    rows   = []
+    rows = []
     for r in scan_results[:12]:
         rows.append(
             f"{r['underlying']}|{r['score']}|{r['direction']}|{r['rsi']}|"
@@ -262,8 +266,8 @@ def _estimate_atm_premium(spot: float, step: float, df, cfg: dict) -> float:
         if df is not None and len(df) >= 10:
             ret = df["close"].pct_change().dropna()
             # annualise from 5-min bars = 252 trading days * 75 bars/day
-            iv  = float(ret.std() * math.sqrt(252 * 75))
-            iv  = max(min(iv, 1.5), 0.05)
+            iv = float(ret.std() * math.sqrt(252 * 75))
+            iv = max(min(iv, 1.5), 0.05)
         else:
             iv = 0.15
 
